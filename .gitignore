@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+.vscode/
+.idea/
+.env
+*.log
+*.bak*
+/data/
+*.db3*
+*.mcap
+*.npy
+map[0-9]*/
+*result_report*/
+Cube_Viewer_config.yaml
+suggested_extrinsics.yaml
