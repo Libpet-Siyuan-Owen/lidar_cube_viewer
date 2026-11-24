@@ -4,7 +4,7 @@ from queue import Queue
 from threading import Event, Thread
 from tkinter import StringVar, ttk
 
-from lidar_cube_core import DATA_DIR
+from lidar_cube_core import WORKSPACE
 from lidar_cube_joint import JOINT_CONFIG
 from lidar_cube_joint_panel import JointPanel
 from lidar_cube_six import GROUPS, LABELS, SIX_CONFIG, load_six, read_group, run_six
@@ -62,7 +62,7 @@ class SixPanel(JointPanel):
 
     def choose_output_parent(self):
         folder = self.viewer.dialog.askdirectory(parent=self.viewer.root, title='选择六包结果保存位置',
-                         initialdir=self.output_parent or DATA_DIR, mustexist=True)
+                         initialdir=self.output_parent or WORKSPACE/'data', mustexist=True)
         if folder:
             self.output_parent = folder
             self.output_display.set(folder)
@@ -71,7 +71,7 @@ class SixPanel(JointPanel):
         initial = self.output or self.output_parent
         if not initial:
             selected = next((v.get() for v in self.paths if v.get()), '')
-            initial = Path(selected).parent.parent if selected else DATA_DIR
+            initial = Path(selected).parent.parent if selected else WORKSPACE/'data'
         return self.viewer.dialog.askopenfilename(parent=self.viewer.root, title=title,
                           initialdir=initial, filetypes=[('拟合配置', filename), ('YAML', '*.yaml')])
 

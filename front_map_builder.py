@@ -13,6 +13,7 @@ import rclpy
 from nav_msgs.msg import Path as PathMsg
 from sensor_msgs.msg import PointCloud2
 from std_srvs.srv import Empty
+from tier4_sensor_calibration_msgs.srv import ExtrinsicCalibrator
 
 from lidar_cube_core import (Bag, Timeline, lidar_topic, read_xyz, stamp_ns,
                              thin, WORKSPACE)
@@ -178,8 +179,6 @@ def run(args):
                           'poses': 0, 'map_points': map_points,
                           'mapping_mode': 'static'}), flush=True)
         return
-    # Only the optional motion-mapping CLI needs the Autoware overlay.
-    from tier4_sensor_calibration_msgs.srv import ExtrinsicCalibrator
     os.environ['ROS_DOMAIN_ID'] = str(args.domain)
     os.environ['ROS_LOCALHOST_ONLY'] = '1'
     rclpy.init()

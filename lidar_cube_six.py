@@ -74,7 +74,7 @@ def run_six(paths, load_settings, progress, cancelled, output_parent=None):
                                config_snapshot=f'bag{len(captures)}_config.yaml'))
     bags = {c.bag for c in captures}
     if len(bags) != 6 or len({b.parent for b in bags}) != 1 or len(set(frames.values())) != 4:
-        raise ValueError('需要同一台机器目录下六个不同的标定包和四个不同的雷达 frame。')
+        raise ValueError('需要同一台数据目录下六个不同的标定包和四个不同的雷达 frame。')
     parent = Path(output_parent or captures[0].bag.parent).expanduser().resolve()
     if not parent.is_dir():
         raise ValueError(f'结果保存目录不存在：{parent}')

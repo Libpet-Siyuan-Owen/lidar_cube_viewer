@@ -256,12 +256,18 @@ def replay(cap, extrinsics, progress, cancelled):
     req = AccumulationRequest(str(cap.bag), '', settings.request.bounds.copy(),
                               extrinsics_source='yaml', extrinsics=str(extrinsics),
                               calibration_sides=cap.sides, max_frames=settings.request.max_frames)
+    clouds, planes, sensor_stats, pairs = evaluate_request(req, settings, progress, cancelled)
+    return dict(pairs=pairs, sensors=sensor_stats, frames=clouds.stats,
+                input_extrinsics=Path(extrinsics).name, summary=aggregate(pairs.values(), 3))
+
+
+def evaluate_request(req, settings, progress, cancelled):
     progress('累计 ROI 点云')
     clouds = accumulate(req, progress=progress, cancelled=cancelled)
     fc = FilterConfig(voxel_size=settings.analysis_voxel, neighbor_radius=settings.filter_radius,
                       min_neighbors=settings.filter_min_neighbors)
     planes, sensor_stats = {}, {}
-    for side in cap.sides:
+    for side in req.active_sides():
         if cancelled():
             raise InterruptedError('回代验证已停止')
         progress(f'{LABEL[side]}雷达滤波与提面')
@@ -280,7 +286,7 @@ def replay(cap, extrinsics, progress, cancelled):
         sensor_stats[side] = dict(summary=summarize_plane_fit(side, entries), faces=entries,
                                   filtered_points=len(points))
     pairs = {}
-    for a, b in combinations(cap.sides, 2):
+    for a, b in combinations(req.active_sides(), 2):
         key = f'{a}-{b}'
         metric = compute_pair_metrics(planes[a], planes[b])
         invalid = [f'{LABEL[s]}雷达：{sensor_stats[s]["summary"]["reason"]}' for s in (a, b)
@@ -289,8 +295,7 @@ def replay(cap, extrinsics, progress, cancelled):
             metric = dict(matched_planes=0, quality='FAIL', reason='；'.join(invalid),
                           measured=metric)
         pairs[key] = metric
-    return dict(pairs=pairs, sensors=sensor_stats, frames=clouds.stats,
-                input_extrinsics=Path(extrinsics).name, summary=aggregate(pairs.values(), 3))
+    return clouds, planes, sensor_stats, pairs
 
 
 def replay_spread(rows):

@@ -9,7 +9,7 @@ import numpy as np
 import yaml
 
 from lidar_cube_joint import CONFIG, JOINT_CONFIG, LABEL, load_joint_config, report_directories, read_json, run_joint
-from lidar_cube_core import DATA_DIR
+from lidar_cube_core import WORKSPACE
 
 
 class JointPanel:
@@ -113,16 +113,16 @@ class JointPanel:
             self.viewer.autosave_current_settings()
 
     def choose_output_parent(self):
-        initial = Path(self.output_parent or self.folders[0].get() or DATA_DIR)
+        initial = Path(self.output_parent or self.folders[0].get() or WORKSPACE/'data')
         path = self.viewer.dialog.askdirectory(parent=self.viewer.root, title='选择联合拟合结果保存目录',
-                                               initialdir=initial if initial.is_dir() else DATA_DIR,
+                                               initialdir=initial if initial.is_dir() else WORKSPACE/'data',
                                                mustexist=True)
         if path:
             self.update_output_parent(path)
 
     def pick_config(self):
         path = self.viewer.dialog.askopenfilename(parent=self.viewer.root, title='加载联合拟合配置',
-                     initialdir=self.output or self.output_parent or self.folders[0].get() or DATA_DIR,
+                     initialdir=self.output or self.output_parent or self.folders[0].get() or WORKSPACE/'data',
                      filetypes=[('联合拟合配置', JOINT_CONFIG), ('YAML', '*.yaml')])
         if not path:
             return
@@ -152,7 +152,7 @@ class JointPanel:
 
     def pick(self, i):
         path = self.viewer.dialog.askdirectory(parent=self.viewer.root, title='Select calibration bag directory',
-                                               initialdir=Path(self.folders[i].get()).parent if self.folders[i].get() else DATA_DIR)
+                                               initialdir=Path(self.folders[i].get()).parent if self.folders[i].get() else WORKSPACE/'data')
         if path:
             self.set_folder(i, Path(path))
 

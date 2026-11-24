@@ -203,6 +203,9 @@ def _orient_plane(normal, offset, reference):
     return normal, offset
 
 
+PAIR_WARNING_LIMITS = (25.0, .08, .20)  # angle (degrees), RMS and P95 (m)
+
+
 def _pair_plane_metrics(plane_a, plane_b, overlap_distance=.03):
     """计算一对对应平面的法向量、点面距离和点云邻近误差。
 
@@ -292,8 +295,8 @@ def _pair_plane_metrics(plane_a, plane_b, overlap_distance=.03):
     if (angle_deg <= 15 and point_metric_finite
             and point_rms <= .05 and point_p95 <= .10):
         quality = 'PASS'
-    elif (angle_deg <= 25 and point_metric_finite
-          and point_rms <= .08 and point_p95 <= .20):
+    elif (angle_deg <= PAIR_WARNING_LIMITS[0] and point_metric_finite
+          and point_rms <= PAIR_WARNING_LIMITS[1] and point_p95 <= PAIR_WARNING_LIMITS[2]):
         quality = 'WARNING'
     else:
         quality = 'FAIL'

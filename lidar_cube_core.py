@@ -9,7 +9,6 @@ from collections import deque
 from contextlib import closing
 from dataclasses import dataclass, field
 import json
-import os
 from pathlib import Path
 import sqlite3
 
@@ -20,8 +19,8 @@ from rclpy.serialization import deserialize_message
 from sensor_msgs.msg import PointCloud2
 from tf2_msgs.msg import TFMessage
 
-WORKSPACE = Path(os.environ.get('LIDAR_CUBE_WORKSPACE', Path.home() / 'calibration_ws')).expanduser()
-DATA_DIR = WORKSPACE / 'data' if (WORKSPACE / 'data').is_dir() else Path.home()
+WORKSPACE = Path('/home/libpeet/calibration_ws')
+DEFAULT_BAG = WORKSPACE / 'data/cube_front_left_pose02'
 FRONT = 'rslidar_airy_front'
 KIT = 'sensor_kit_base_link'
 BASE = 'base_link'

@@ -12,6 +12,7 @@ from queue import Empty, Queue
 import subprocess
 import sys
 import tempfile
+import shlex
 from threading import Event, Thread
 from datetime import datetime
 
@@ -19,8 +20,8 @@ import numpy as np
 import yaml
 from lidar_cube_correction import attach_extrinsic_report
 from lidar_cube_core import (
-    AccumulationRequest, AccumulationResult, COLORS, DATA_DIR,
-    ALL_SIDES, KIT, MAPPING_SIDES, accumulate,
+    AccumulationRequest, AccumulationResult, COLORS, DEFAULT_BAG,
+    ALL_SIDES, KIT, MAPPING_SIDES, WORKSPACE, accumulate,
     LEGACY_CALIBRATION_TARGETS, normalize_pose_rows, thin,
 )
 
@@ -122,8 +123,9 @@ class ViewerSettings:
 
 def default_settings():
     return ViewerSettings(AccumulationRequest(
-        '', '',
+        str(DEFAULT_BAG), '',
         np.array([[1.8, 3.5], [4.9, 6.5], [.08, .70]]),
+        extrinsics=str(WORKSPACE / 'data/calibration_results.yaml'),
         calibration_sides=('front', 'left'),
         static_mapping=True),
         front_map='')
@@ -632,7 +634,8 @@ class Viewer:
             if value:
                 self.set_data_root(value)
                 return Path(self.data_root)
-        raise ValueError('请先选择一个标定包。')
+        self.set_data_root(WORKSPACE / 'data')
+        return Path(self.data_root)
 
     def autosave_current_settings(self):
         """Persist the current UI state in the selected dataset directory."""
@@ -868,7 +871,7 @@ class Viewer:
 
     def pick_bag(self):
         path = self.dialog.askopenfilename(title='Select ROS 2 bag metadata.yaml or .db3',
-                                          initialdir=DATA_DIR,
+                                          initialdir=WORKSPACE / 'data',
                                           filetypes=[('ROS 2 SQLite bag', '*.db3 *.yaml')],
                                           parent=self.root)
         if path:
@@ -880,7 +883,7 @@ class Viewer:
         """选择包含各雷达静态地图的统一目录。"""
         path = self.dialog.askdirectory(
             title='选择包含所有雷达静态地图的目录',
-            initialdir=DATA_DIR,
+            initialdir=WORKSPACE / 'data',
             mustexist=True,
             parent=self.root)
         if path:
@@ -1167,10 +1170,18 @@ class Viewer:
         for index, side in enumerate(sides, start=1):
             self.events.put(('progress',
                              f'[{index}/{len(sides)}] 开始建立{labels.get(side, side)}雷达独立地图……'))
-            command = [sys.executable, str(builder), '--static', '--sensor-side', side,
-                       '--bag', bag, '--output', str(output)]
+            shell_command = ' '.join([
+                'source /opt/ros/humble/setup.bash', '&&',
+                f'source {shlex.quote(str(WORKSPACE / "install/setup.bash"))}', '&&',
+                'exec', shlex.quote(sys.executable), shlex.quote(str(builder)),
+                '--sensor-side', shlex.quote(side),
+                '--bag', shlex.quote(bag), '--output', shlex.quote(str(output)),
+                '--rate', '1.0',
+            ])
+            # 静态累计是唯一建图路径，不再启动 NDT 或保存运动轨迹。
+            shell_command += ' --static'
             try:
-                process = subprocess.Popen(command,
+                process = subprocess.Popen(['bash', '-lc', shell_command],
                                            stdout=subprocess.PIPE,
                                            stderr=subprocess.STDOUT, text=True)
                 self.build_process = process
@@ -1205,7 +1216,7 @@ class Viewer:
 
     def pick_extrinsics(self):
         path = self.dialog.askopenfilename(title='Select calibrated extrinsics YAML',
-                                          initialdir=DATA_DIR,
+                                          initialdir=WORKSPACE / 'data',
                                           filetypes=[('Extrinsics YAML', '*.yaml *.yml')],
                                           parent=self.root)
         if path:
@@ -2133,4 +2144,8 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    if len(sys.argv) == 1:
+        from v02_ui import main as run_batch_ui
+        run_batch_ui()
+    else:
+        main()
