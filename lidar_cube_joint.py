@@ -251,12 +251,14 @@ def aggregate(pairs, expected):
                 normal_deg=float(np.mean([p['normal_error_deg'] for p in valid])) if valid else None)
 
 
-def replay(cap, extrinsics, progress, cancelled):
+def replay(cap, extrinsics, progress, cancelled, on_geometry=None):
     settings = cap.settings
     req = AccumulationRequest(str(cap.bag), '', settings.request.bounds.copy(),
                               extrinsics_source='yaml', extrinsics=str(extrinsics),
                               calibration_sides=cap.sides, max_frames=settings.request.max_frames)
     clouds, planes, sensor_stats, pairs = evaluate_request(req, settings, progress, cancelled)
+    if on_geometry is not None:
+        on_geometry(clouds, planes)
     return dict(pairs=pairs, sensors=sensor_stats, frames=clouds.stats,
                 input_extrinsics=Path(extrinsics).name, summary=aggregate(pairs.values(), 3))
 

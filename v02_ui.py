@@ -1,4 +1,5 @@
 """Operator view: select a machine, confirm six targets, export four radar mounts."""
+from dataclasses import replace
 from pathlib import Path
 from itertools import combinations
 from queue import Empty, Queue
@@ -12,6 +13,8 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.collections import LineCollection
 from v02_results import Results
+from v02_scene import SceneReport
+from v02_scene_panel import ScenePanel
 from v02_batch import (MACHINE_FILE, PARAMS, ROI_FILE, SLOTS, calibrate, corners, discover,
                        preview, valid_bounds, write_yaml)
 
@@ -37,25 +40,73 @@ class BatchViewer:
         self.roi_window = None
         self.parent=None;self.models={};self.notes={};self.output=None;self.busy=False
         self.cache={};self.events=Queue();self.stop=Event();self.axes={};self.cancelled=False
-        top=ttk.Frame(root,padding=8);top.pack(fill='x');ttk.Button(top,text='选择数据目录…',command=self.choose).pack(side='left')
+        top=ttk.Frame(root,padding=8);top.pack(fill='x')
+        self.view_report = self.workspace_report = None
+        self.config_notice = ''
+        self.mode = ttk.Combobox(top, values=('快速选定 ROI','3D点云展示'), width=15, state='disabled')
+        self.mode.current(0)
+        self.mode.pack(side='left', padx=(0, 6))
+        self.mode.bind('<<ComboboxSelected>>', self.switch_mode)
+        ttk.Button(top, text='打开标定结果…', command=self.choose_report).pack(side='left', padx=4)
+        ttk.Button(top,text='选择数据目录…',command=self.choose).pack(side='left')
         self.folder=tk.StringVar(value='请选择含六个 bag 的数据目录');ttk.Label(top,textvariable=self.folder).pack(side='left',padx=8)
+        self.roi = ttk.Frame(root)
+        self.roi.pack(fill='both', expand=True)
+        self.inspector = ScenePanel(root, self.events)
         self.figure=Figure(figsize=(10,5),dpi=85);self.figure.subplots_adjust(left=.06,right=.98,top=.90,bottom=.10,hspace=.46,wspace=.17)
-        self.canvas=FigureCanvasTkAgg(self.figure,master=root);self.canvas.get_tk_widget().pack(fill='both',expand=True)
+        self.canvas=FigureCanvasTkAgg(self.figure,master=self.roi);self.canvas.get_tk_widget().pack(fill='both',expand=True)
         self.canvas.mpl_connect('button_press_event',self.click)
         for idx,k in enumerate(SLOTS):self.axes[k]=self.figure.add_subplot(2,3,idx+1)
-        ttk.Label(root,text='点击预览可调整框或更换包。虚线为搜索范围，绿色实线为累计范围。').pack(anchor='w',padx=12)
-        self.params={k:tk.StringVar(value=str(v)) for k,v in PARAMS.items()};self.param_area=ttk.Frame(root);self.fields=ttk.Frame(self.param_area)
+        ttk.Label(self.roi,text='点击预览可调整框或更换包。虚线为搜索范围，绿色实线为累计范围。').pack(anchor='w',padx=12)
+        self.params={k:tk.StringVar(value=str(v)) for k,v in PARAMS.items()};self.param_area=ttk.Frame(self.roi);self.fields=ttk.Frame(self.param_area)
         self.param_area.pack(fill='x',padx=8);ttk.Button(self.param_area,text='平面拟合参数（六包共用）',command=self.toggle_params).pack(anchor='w')
         for i,((key,var),label) in enumerate(zip(self.params.items(),FIELDS)):
             ttk.Label(self.fields,text=label).grid(row=0,column=i,padx=3);ttk.Entry(self.fields,textvariable=var,width=10).grid(row=1,column=i,padx=3)
-        bottom=ttk.Frame(root,padding=8);bottom.pack(fill='x');self.start_button=ttk.Button(bottom,text='确认全部并开始标定',command=self.start);self.start_button.pack(side='left')
+        bottom=ttk.Frame(self.roi,padding=8);bottom.pack(fill='x');self.start_button=ttk.Button(bottom,text='确认全部并开始标定',command=self.start);self.start_button.pack(side='left')
         for title,item in [('打开结果目录',''),('打开最终外参','suggested_extrinsics.yaml')]:
             ttk.Button(bottom,text=title,command=lambda item=item:self.open_output(item)).pack(side='left',padx=4)
-        self.status=tk.StringVar(value='等待选择数据目录');ttk.Label(root,textvariable=self.status,wraplength=1050).pack(anchor='w',padx=10,pady=5)
-        self.results = Results(root)
+        self.status=tk.StringVar(value='等待选择数据目录');ttk.Label(self.roi,textvariable=self.status,wraplength=1050).pack(anchor='w',padx=10,pady=5)
+        self.results = Results(self.roi)
         self.results.pack(side='bottom', fill='x', padx=8, pady=(0, 6))
         self.run_started = False
         root.protocol('WM_DELETE_WINDOW',self.close);self.refresh();root.after(100,self.poll)
+
+    def lock_view(self):
+        self.workspace_report = None
+        self.mode.current(0)
+        self.switch_mode()
+        self.mode.configure(state='disabled')
+        self.view_report = None
+
+    def switch_mode(self, event=None):
+        if self.mode.current() == 1 and self.view_report is not None and not self.busy:
+            self.roi.pack_forget()
+            self.inspector.pack(fill='both', expand=True)
+            self.inspector.open(self.view_report)
+        else:
+            self.inspector.cancel.set()
+            self.inspector.pack_forget()
+            self.roi.pack(fill='both', expand=True)
+            self.mode.current(0)
+            self.view_report = self.workspace_report
+            self.mode.configure(state='readonly' if self.workspace_report else 'disabled')
+
+    def choose_report(self):
+        if self.busy or self.raise_roi_editor():
+            return
+        path = filedialog.askdirectory(parent=self.root, initialdir=self.parent or Path.home(),
+                                        title='打开成功的六包标定结果目录')
+        if path:
+            try:
+                report = SceneReport(path)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                from tkinter import messagebox
+                messagebox.showerror('无法打开结果', str(exc), parent=self.root)
+                return
+            self.view_report = report
+            self.mode.configure(state='readonly')
+            self.mode.current(1)
+            self.switch_mode()
 
     def report(self, message):
         self.status.set(message)
@@ -79,19 +130,34 @@ class BatchViewer:
 
     def load_machine(self,path):
         if self.busy:return
+        self.lock_view()
         self.cache.clear();self.parent=path.resolve();self.folder.set(str(self.parent));self.models={};self.notes={};self.output=None;self.refresh()
         try:
             self.results.new(self.parent.name)
             self.run_started = False
             self.report(f'已选择数据目录　{self.parent}')
-            state=yaml.safe_load((path/MACHINE_FILE).read_text()) if (path/MACHINE_FILE).is_file() else {}
+            self.config_notice = ''
+            state = {}
+            if (path/MACHINE_FILE).is_file():
+                try:
+                    state = yaml.safe_load((path/MACHINE_FILE).read_text())
+                    if not isinstance(state, dict) or any(not isinstance(state.get(k, {}), dict) for k in ('bags','params')):
+                        raise ValueError('配置格式无效')
+                except (OSError, ValueError, yaml.YAMLError):
+                    state = {}
+                    self.config_notice = '机器配置无法读取，已按名称识别并使用默认参数。'
+
             found=discover(path); selected={}
             for k,v in self.params.items():v.set(str(state.get('params',{}).get(k,PARAMS[k])))
             for k in SLOTS:
-                stored=state.get('bags',{}).get(k,'');candidate=path/stored
-                if stored and candidate.parent==path and candidate.is_dir():selected[k]=candidate
+                stored=state.get('bags',{}).get(k,'')
+                candidate = path/stored if isinstance(stored, str) and stored else None
+                if candidate and candidate.parent==path and candidate.is_dir() and next(candidate.glob('*.db3'),None):selected[k]=candidate
                 elif len(found[k])==1:selected[k]=found[k][0]
                 else:self.notes[k]='缺包或重名，点击补选'
+            for slot, bag in list(selected.items()):
+                if list(selected.values()).count(bag) > 1:
+                    selected = {k: v for k, v in selected.items() if v != bag}
             self.load_slots(selected)
         except Exception as exc:self.report(str(exc))
 
@@ -111,6 +177,7 @@ class BatchViewer:
                 key,value=self.events.get_nowait()
                 if key=='progress':self.status.set(value)
                 elif key=='bag':self.results.current.bag(*value)
+                elif key=='scene':self.inspector.receive(*value)
                 elif key=='mount':self.results.current.mount(*value)
                 elif key=='preview':
                     k,p,msg=value; self.notes[k]=msg
@@ -122,9 +189,15 @@ class BatchViewer:
                         self.report(f'{k} · 预览失败　{msg}')
                     self.refresh()
                 elif key=='ready':
-                    self.busy=False;need=[k for k in SLOTS if k not in self.models or self.models[k].manual];self.report('请点击检查 '+', '.join(need) if need else '六个摆位已就绪，请核对绿色累计框。')
+                    self.busy=False;need=[k for k in SLOTS if k not in self.models or self.models[k].manual];self.report(self.config_notice + ('请点击检查 '+', '.join(need) if need else '六个摆位已就绪，请核对绿色累计框。'))
                 elif key=='done':
                     self.busy=False;self.output,fail=value;self.report('已导出四雷达外参  '+str(self.output) if not fail else '复验失败，请调整后重试  '+', '.join(fail)+'　结果目录 '+str(self.output))
+                    if not fail:
+                        try:
+                            self.workspace_report = self.view_report = SceneReport(self.output)
+                            self.mode.configure(state='readonly')
+                        except (ValueError, OSError, KeyError, TypeError) as exc:
+                            self.report(f'无法打开 3D 结果：{exc}')
                 elif key=='error':self.busy=False;self.report(str(value))
         except Empty:pass
         self.root.after(100,self.poll)
@@ -151,14 +224,14 @@ class BatchViewer:
         win.transient(self.root)
 
         ttk.Label(win,text=(str(p.bag)+'  ·  '+p.note if p else self.notes.get(k,'请选择 bag'))).pack(padx=8,pady=5)
-        def replace():
+        def replace_bag():
             path=filedialog.askdirectory(parent=win,initialdir=self.parent,title=k+' 选择数据包目录')
             if not path:return
             bag=Path(path).resolve()
             if bag.parent!=self.parent or any(x.bag==bag for key,x in self.models.items() if key!=k):
                 self.report('请选择本机目录下未被其他格使用的数据包');return
-            win.destroy();self.output=None;self.load_slots({k:bag})
-        ttk.Button(win,text='更换此包…',command=replace).pack(anchor='e',padx=8)
+            win.destroy();self.lock_view();self.output=None;self.load_slots({k:bag})
+        ttk.Button(win,text='更换此包…',command=replace_bag).pack(anchor='e',padx=8)
         if not p:return win
         bounds=p.bounds.copy();fig=Figure(figsize=(8,4.4));fig.subplots_adjust(bottom=.16);canvas=FigureCanvasTkAgg(fig,master=win);canvas.get_tk_widget().pack(fill='both',expand=True)
         top,side=fig.subplots(1,2);drag={};step=tk.StringVar(value='0.05')
@@ -179,7 +252,14 @@ class BatchViewer:
             except (ValueError,AssertionError):self.report('调整量无效或 ROI 尺寸太小')
         for text,sign in [('扩大',1),('缩小',-1)]:ttk.Button(bar,text=text,command=lambda s=sign:resize(s)).pack(side='left')
         def confirm():
-            p.bounds=bounds.copy();p.manual=False;p.note='已人工确认';self.save_roi(p)
+            updated = replace(p, bounds=bounds.copy(), manual=False, note='已人工确认')
+            try:
+                self.save_roi(updated)
+            except OSError as exc:
+                self.report(f'{k} 的 ROI 未保存：{exc}')
+                return
+            self.models[k] = updated
+            self.lock_view()
             self.report(f'{k} · 已人工确认并保存 ROI');self.output=None;self.refresh();win.destroy()
         ttk.Button(bar,text='确认此 ROI',command=confirm).pack(side='right');return win
 
@@ -198,6 +278,7 @@ class BatchViewer:
         except Exception as exc:self.report('无法开始：'+str(exc));return
         if self.run_started:
             self.results.new(self.parent.name)
+        self.lock_view()
         self.run_started = True
         self.output=None;self.busy=True;self.report(f'开始新一轮标定 · 六个 ROI 已保存，内点阈值 {params["plane_threshold"]} m，迭代 {params["plane_max_iterations"]} 次')
         def work():
@@ -209,7 +290,7 @@ class BatchViewer:
         if self.output and (self.output/item).exists():subprocess.Popen(['xdg-open',str(self.output/item)])
         else:self.report('尚无可打开的结果')
 
-    def close(self):self.stop.set();self.root.destroy()
+    def close(self):self.inspector.cancel.set();self.stop.set();self.root.destroy()
 
 
 def validate_params(params):

@@ -14,6 +14,7 @@ from lidar_cube_core import (Bag, BASE, FRONT, KIT, MAPPING_SIDES, AccumulationR
     find_chain, compose_chain)
 from lidar_cube_joint import Capture, fit_joint, evaluate_request, replay, correspondence, xyz_record
 from lidar_cube_viewer import ViewerSettings
+from v02_scene import Scene, pack_edges, transform_key
 
 SLOTS = tuple(f'{group}_{pose}' for group in ('FLT','FRT') for pose in ('F3d','0.3L','0.3R'))
 PARAMS = dict(plane_threshold=.02, plane_min_inliers=20, plane_max_planes=3, plane_max_iterations=100,
@@ -160,9 +161,17 @@ def preview(path,slot,use_map=True):
     manual=delta is None;note=('地图坐标缺失，按设备坐标人工确认' if not world else '请人工确认模板框' if manual else '已定位')
     saved=bag.directory/ROI_FILE
     if saved.is_file():
-        state=yaml.safe_load(saved.read_text());
-        if state['slot']==slot and state['bag']==bag.directory.name:
-            bound=valid_bounds(state['bounds']);manual=False;note='已恢复 ROI' if world else '已恢复 ROI · 设备坐标'
+        try:
+            state = yaml.safe_load(saved.read_text())
+            if not isinstance(state, dict):
+                raise ValueError('ROI 配置为空或格式错误')
+            if state['slot'] == slot and state['bag'] == bag.directory.name:
+                bound = valid_bounds(state['bounds'])
+                manual = False
+                note = '已恢复 ROI' if world else '已恢复 ROI · 设备坐标'
+        except (OSError, ValueError, TypeError, KeyError, yaml.YAMLError):
+            manual = True
+            note = '已保存的 ROI 无法读取，请重新确认范围'
     return Preview(bag.directory,slot,pose,pts,search,bound,manual,note)
 
 
@@ -194,6 +203,9 @@ def log_bag_result(log, slot, stage, stats, pairs):
 def calibrate(previews,params,parent,progress,cancelled,cache=None,log=None,on_result=None):
     if log is None:
         log = progress
+    scenes = {}
+    sources = {}
+    changes = {}
     caps=[]; frames={};baseline={};initial=[]
     if [p.slot for p in previews]!=list(SLOTS) or len({p.bag for p in previews})!=6:raise ValueError('需要六个不同摆位的数据包')
     for p in previews:
@@ -203,7 +215,7 @@ def calibrate(previews,params,parent,progress,cancelled,cache=None,log=None,on_r
                          tuple((f.name, f.stat().st_size, f.stat().st_mtime_ns) for f in sorted(p.bag.glob('*.db3'))))
             saved = cache.get(p.slot) if cache is not None else None
             if saved and saved[0] == signature:
-                cap, record = saved[1:]
+                cap, record, scenes[p.slot], sources[p.slot] = saved[1:]
                 for side in sides:
                     if side in baseline:
                         diff = baseline[side].inverse() @ cap.baseline[side]
@@ -237,9 +249,12 @@ def calibrate(previews,params,parent,progress,cancelled,cache=None,log=None,on_r
                     diff=baseline[s].inverse()@old[s]
                     if frames[s]!=fr[s] or np.linalg.norm(diff.translation)>1e-6 or diff.rotation.magnitude()>1e-6:raise ValueError(f'{s} 安装基准不一致')
                 frames[s],baseline[s]=fr[s],old[s]
+            scenes[p.slot] = Scene.capture(clouds, planes)
+            sources[p.slot] = dict(frames=fr, edges=pack_edges(edges),
+                initial=transform_key({s: old['front'].inverse() @ old[s] for s in sides}))
             patches=[[planes[s][i].points for i in idx] for s,idx in zip(sides,order)]
             caps.append(Capture(p.bag,None,'',settings,sides,fr,old,patches,{}));initial.append(dict(slot=p.slot,sensors=stats,pairs=pairs,frames=clouds.stats));del clouds
-            if cache is not None:cache[p.slot]=(signature,caps[-1],initial[-1])
+            if cache is not None:cache[p.slot]=(signature,caps[-1],initial[-1],scenes[p.slot],sources[p.slot])
         except Exception as exc:raise ValueError(f'{p.slot} / {p.bag.name}：{exc}') from exc
     progress('六包四雷达联合拟合');poses=fit_joint(caps,cancelled,MAPPING_SIDES);front=baseline['front']; mounts={}
     log('六包联合求解完成，前雷达锁定')
@@ -249,6 +264,7 @@ def calibrate(previews,params,parent,progress,cancelled,cache=None,log=None,on_r
         old = baseline[side]
         displacement_cm = 100 * np.linalg.norm(new.translation-old.translation)
         angle_deg = np.rad2deg((old.rotation.inv()*new.rotation).magnitude())
+        changes[side] = [(100*(new.translation-old.translation)).tolist(), float(angle_deg)]
         if on_result:
             on_result('mount', (side, 100*(new.translation-old.translation), angle_deg))
         log(f'{RADAR_NAMES[side]}雷达 · 相对 /tf_static 安装修正 {displacement_cm:.2f} cm，{angle_deg:.2f}°')
@@ -256,7 +272,16 @@ def calibrate(previews,params,parent,progress,cancelled,cache=None,log=None,on_r
         stage=Path(tmp)/'result';stage.mkdir();candidate=stage/'candidate.yaml';write_yaml(candidate,{KIT:mounts});rows=[];failures=[]
         for p,cap in zip(previews,caps):
             try:
-                row=replay(cap,candidate,lambda msg:progress(p.slot+' · 复验 · '+msg),cancelled)
+                folder = stage/'clouds_3d'/p.slot
+                scenes[p.slot].save(folder/'initial.npz')
+                def save_joint(clouds, planes):
+                    scene = Scene.capture(clouds, planes)
+                    scene.save(folder/'joint.npz')
+                    from scipy.spatial.transform import Rotation
+                    mounts_used = {s: Transform(Rotation.from_quat(t['quaternion_xyzw']), np.array(t['translation']))
+                                   for s, t in scene.metadata['mounts'].items()}
+                    sources[p.slot]['joint'] = transform_key(mounts_used)
+                row=replay(cap,candidate,lambda msg:progress(p.slot+' · 复验 · '+msg),cancelled,on_geometry=save_joint)
             except Exception as exc:
                 raise RuntimeError(f'{p.slot} / {p.bag.name} 复验失败：{exc}') from exc
             rows.append(row)
@@ -267,7 +292,7 @@ def calibrate(previews,params,parent,progress,cancelled,cache=None,log=None,on_r
                 if m.get('quality') not in ('PASS','WARNING') or m.get('matched_planes')!=3:failures.append(p.slot+' '+key)
             if row['summary']['valid']!=3 and not any(f.startswith(p.slot+' ') for f in failures):failures.append(p.slot+' 配对不完整')
         inputs=[dict(slot=p.slot,bag=p.bag.name,bounds=p.bounds.tolist()) for p in previews];write_yaml(stage/'batch_config.yaml',dict(params=params,cases=inputs));
-        (stage/'validation.json').write_text(json.dumps(dict(cases=inputs,params=params,initial=initial,validation=rows,failures=failures),ensure_ascii=False,indent=2,allow_nan=False));
+        (stage/'validation.json').write_text(json.dumps(dict(cases=inputs,params=params,initial=initial,validation=rows,failures=failures,scene_sources=sources,mount_changes=changes),ensure_ascii=False,indent=2,allow_nan=False));
         if not failures:candidate.rename(stage/'suggested_extrinsics.yaml')
         out=parent/('FLRT_V02_result_report_'+datetime.now().strftime('%Y%m%d_%H%M%S_%f'));stage.rename(out)
     return out,failures
