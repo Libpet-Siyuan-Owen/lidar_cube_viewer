@@ -1,8 +1,10 @@
 """V02 运行结果表。每轮保留独立的界面记录。"""
 from datetime import datetime
+import tkinter as tk
 from tkinter import ttk
+from tkinter.scrolledtext import ScrolledText
 
-from v02_charts import MetricChart, chart_rows
+from v02_charts import MetricChart, chart_rows, initial_deviation, match_detail
 from v02_batch import RADAR_NAMES, SLOTS
 
 
@@ -14,6 +16,9 @@ class RunTables(ttk.Notebook):
     def __init__(self, parent):
         super().__init__(parent)
         self.records = {}
+        self.issues = []
+        self.row_reasons = {}
+        self.detail_window = None
         self.pages = []
         self.charts = {}
         self.planes = self.table('平面拟合', (
@@ -31,6 +36,8 @@ class RunTables(ttk.Notebook):
         for col in columns:
             view.heading(col, text=col)
             view.column(col, width=100, minwidth=50, anchor='center')
+        if '评级' in columns:
+            view.bind('<Double-1>', lambda event: self.open_row_reason(view, event))
         for tag, color in [('PASS', '#176347'), ('WARNING', '#915b00'), ('FAIL', '#ad2626')]:
             view.tag_configure(tag, foreground=color)
         scroll = ttk.Scrollbar(body, command=view.yview)
@@ -56,20 +63,62 @@ class RunTables(ttk.Notebook):
     def bag(self, slot, stage, stats, pairs, frames):
         for side, sensor in stats.items():
             fit = sensor['summary']
-            self.planes.insert('', 'end', tags=(fit['quality'],), values=(
+            if fit['quality'] == 'FAIL':
+                self.add_issue(f"{slot} · {stage} · {RADAR_NAMES[side]}雷达拟合：{fit['reason']}")
+            item = self.planes.insert('', 'end', tags=(fit['quality'],), values=(
                 slot, RADAR_NAMES[side], stage, frames[side]['used_frames'], frames[side]['roi_points'],
                 sensor['filtered_points'], fit['plane_count'], number(fit['max_right_angle_deviation_deg']),
-                number(fit['max_plane_rms_m'], 1000), fit['quality']))
+                number(fit['max_plane_rms_m'], 1000), 'FAIL · 详情' if fit['quality']=='FAIL' else fit['quality']))
+            if fit['quality'] == 'FAIL':
+                self.row_reasons[self.planes, item] = self.issues[-1]
         for key, match in pairs.items():
             name = '–'.join(RADAR_NAMES[s] for s in key.split('-'))
-            self.pairs.insert('', 'end', tags=(match['quality'],), values=(
+            quality = match['quality']
+            rating = quality
+            tag = quality
+            if quality == 'FAIL':
+                detail = f'{slot} · {stage} · {name}匹配：' + match_detail(key, match, stage)
+                if initial_deviation(stage, match):
+                    rating, tag = '初始偏差 · 详情', 'WARNING'
+                else:
+                    rating = 'FAIL · 详情'
+                    self.add_issue(detail)
+            item = self.pairs.insert('', 'end', tags=(tag,), values=(
                 slot, name, stage, number(match.get('corner_distance_m'), 100),
-                number(match.get('normal_error_deg')), match['quality']))
+                number(match.get('normal_error_deg')), rating))
+            if quality == 'FAIL':
+                self.row_reasons[self.pairs, item] = detail
 
         self.records[slot, stage] = stats, pairs
+        if self.master.displayed is self:
+            self.master.update_issues()
 
         if self.master.displayed is self and self.master.mode.get() == '柱状图':
             self.master.refresh_view()
+
+    def open_row_reason(self, view, event):
+        reason = self.row_reasons.get((view, view.identify_row(event.y)))
+        if reason:
+            from tkinter import messagebox
+            messagebox.showinfo('本行指标详情', reason, parent=self)
+
+    def add_issue(self, message):
+        self.issues.append(message)
+        if self.detail_window is not None and self.detail_window.winfo_exists():
+            self.detail_text.configure(state='normal')
+            self.detail_text.insert('end', message + '\n\n')
+            self.detail_text.configure(state='disabled')
+
+    def show_issues(self):
+        if self.detail_window is not None and self.detail_window.winfo_exists():
+            self.detail_window.lift()
+            return
+        self.detail_window = tk.Toplevel(self)
+        self.detail_window.title('本轮标定 · 失败原因')
+        self.detail_text = ScrolledText(self.detail_window, wrap='word', width=80, height=18)
+        self.detail_text.pack(fill='both', expand=True)
+        self.detail_text.insert('end', '\n\n'.join(self.issues) + '\n\n')
+        self.detail_text.configure(state='disabled')
 
     def mount(self, side, delta, rotation):
         name = '前 · 锁定' if side == 'front' else RADAR_NAMES[side]
@@ -98,10 +147,17 @@ class Results(ttk.Frame):
         self.slot.current(0)
         self.slot.pack(side='left')
         self.slot.bind('<<ComboboxSelected>>', self.refresh_view)
+        self.issues_button = ttk.Button(bar, text='失败原因（0）', state='disabled',
+                                       command=lambda: self.displayed.show_issues())
+        self.issues_button.pack(side='right', padx=4)
         self.runs = []
         self.labels = []
         self.current = self.displayed = self.make_run()
         self.displayed.pack(fill='both', expand=True)
+
+    def update_issues(self):
+        count = len(self.displayed.issues)
+        self.issues_button.configure(text=f'失败原因（{count}）', state='normal' if count else 'disabled')
 
     def make_run(self):
         run = RunTables(self)
@@ -138,5 +194,6 @@ class Results(ttk.Frame):
     def show(self, index):
         self.displayed.pack_forget()
         self.displayed = self.runs[index]
+        self.update_issues()
         self.displayed.pack(fill='both', expand=True)
         self.refresh_view()

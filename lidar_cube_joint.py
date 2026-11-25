@@ -98,7 +98,7 @@ def correspondence(metrics, a, b):
         i, j = match['plane_a_index'] - 1, match['plane_b_index'] - 1
         mapping[j if reverse else i] = i if reverse else j
     if set(mapping) != {0, 1, 2} or set(mapping.values()) != {0, 1, 2}:
-        raise ValueError(f'{LABEL[a]}–{LABEL[b]}缺少三个面的一一对应')
+        raise ValueError(f"{LABEL[a]}–{LABEL[b]}缺少三个面的一一对应。{entry.get('reason', '')}")
     return [mapping[i] for i in range(3)]
 
 
@@ -174,8 +174,15 @@ def seed_board(front_faces):
     return u @ vt, corner
 
 
-def fit_joint(captures, cancelled, sides=None):
-    """每个摆位有九个点集，在对应靶面上最小化点面距离。每个面等权。
+def face_weight(points):
+    # Effective support after voxel filtering: penalize sparse or narrow footprints.
+    # Saturating the weight prevents the dense front lidar from dominating.
+    centered = points - np.mean(points, axis=0)
+    spreads = np.linalg.svd(centered, compute_uv=False) / np.sqrt(len(points))
+    return float(np.clip((len(points)/100.) * min(1., (spreads[1]/.08)**2), .10, 1.))
+
+def fit_joint(captures, cancelled, sides=None, *, support_weighting=False, position_penalty=0.):
+    """每个摆位有九个点集，在对应靶面上最小化稳健点面残差。
 
     前雷达固定，各个非前雷达共用其物理雷达对应的六个未知量，
     每个靶标另有六个未知量。各摆位共用同一组安装外参。
@@ -185,6 +192,11 @@ def fit_joint(captures, cancelled, sides=None):
     poses = [Transform.identity() for _ in sides]
     boards = [seed_board(c.surfaces[0]) for c in captures]
 
+    weights = [[[face_weight(p) if support_weighting else 1. for p in faces]
+                for faces in cap.surfaces] for cap in captures]
+    anchor = captures[0].baseline['front']
+    origins = [(anchor.inverse() @ next(c.baseline[s] for c in captures if s in c.sides)).translation
+               for s in sides[1:]]
     n_parameters = radar_cols + 6 * len(captures)
 
     def linearize(poses, boards, derivative):
@@ -194,13 +206,13 @@ def fit_joint(captures, cancelled, sides=None):
         for k, cap in enumerate(captures):
             normals, center = boards[k]
             target_cols = list(range(radar_cols + 6*k, radar_cols + 6*(k+1)))
-            for side, faces in zip(cap.sides, cap.surfaces):
+            for side, faces, face_weights in zip(cap.sides, cap.surfaces, weights[k]):
                 s = sides.index(side)
-                for n, pts in zip(normals, faces):
+                for n, pts, weight in zip(normals, faces, face_weights):
                     q = poses[s].apply(pts)
                     distances = (q - center) @ n
                     robust = np.hypot(1, distances / .015)
-                    cost += np.mean(2 * distances**2 / (robust + 1))
+                    cost += weight * np.mean(2 * distances**2 / (robust + 1))
                     if not derivative:
                         continue
                     axis = np.broadcast_to(n, q.shape)
@@ -209,17 +221,31 @@ def fit_joint(captures, cancelled, sides=None):
                     if s:
                         jac = np.column_stack((np.cross(q, n), axis, jac))
                         cols = list(range(6*(s-1), 6*s)) + target_cols
-                    weighted = jac / (len(q) * robust[:, None])
+                    weighted = weight * jac / (len(q) * robust[:, None])
                     gram[np.ix_(cols, cols)] += weighted.T @ jac
                     gradient[cols] += weighted.T @ distances
+        # Check observability using measurements alone, before adding the prior.
+        if derivative:
+            rank = np.linalg.matrix_rank(gram)
+            if rank != n_parameters:
+                raise ValueError(f'第 {iteration} 次迭代约束矩阵秩 {rank}/{n_parameters}，请检查摆位和面覆盖')
+        for s, origin in enumerate(origins, 1):
+            if not position_penalty:
+                break
+            moved = poses[s].apply(origin)
+            delta = moved - origin
+            cost += position_penalty * (delta @ delta)
+            if derivative:
+                jac = np.column_stack((np.cross(np.eye(3), moved).T, np.eye(3)))
+                sl = slice(6*(s-1), 6*s)
+                gram[sl,sl] += position_penalty * jac.T @ jac
+                gradient[sl] += position_penalty * jac.T @ delta
         return cost, gram, gradient
 
-    for _ in range(80):
+    for iteration in range(1, 81):
         if cancelled():
             raise InterruptedError('联合拟合已停止')
         cost, gram, gradient = linearize(poses, boards, True)
-        if np.linalg.matrix_rank(gram) != len(gram):
-            raise ValueError('所选摆位的几何约束不足，无法确定外参')
         step = np.linalg.solve(gram, -gradient)
         if abs(step).max() < 1e-8:
             return poses
@@ -236,11 +262,59 @@ def fit_joint(captures, cancelled, sides=None):
         else:
             if abs(gradient).max() < 1e-6:
                 return poses
-            raise ValueError('联合拟合未收敛，请检查靶面对应和覆盖范围')
+            raise ValueError(f'第 {iteration} 次迭代尝试 6 种步长后，点面目标值均未下降。请检查各摆位靶面对应和覆盖。')
         poses, boards = trial, targets
         if cost - updated < 1e-13:
             return poses
-    raise ValueError('联合拟合达到迭代上限')
+    raise ValueError('联合求解达到 80 次迭代上限。请检查摆位和对应面，界面中的迭代次数仅控制单面采样。')
+
+
+def select_joint(captures, sides, progress, cancelled, on_geometry=None):
+    """Choose only from raw replays on this machine. Keep the last candidate for failure diagnostics."""
+    from tempfile import TemporaryDirectory
+    sides = tuple(sides)
+    first = captures[0]
+    anchor = first.baseline['front']
+    baseline = {s: t for c in captures for s, t in c.baseline.items()}
+    frames = {s: f for c in captures for s, f in c.frames.items()}
+    attempts = []
+    candidates = [('弱面降权', True, .02), ('等权面', False, .02)]
+    if len(captures) == 3:
+        candidates.append(('弱面降权、加强位置约束', True, .08))
+    candidates.append(('原等权解', False, 0.))
+    with TemporaryDirectory(prefix='cube_candidate_') as tmp:
+        path = Path(tmp) / 'candidate.yaml'
+        for method, weighted, penalty in candidates:
+            if cancelled():
+                raise InterruptedError('联合拟合已停止')
+            progress(f'联合拟合 · {method}')
+            try:
+                poses = fit_joint(captures, cancelled, sides, support_weighting=weighted, position_penalty=penalty)
+            except (ValueError, np.linalg.LinAlgError) as exc:
+                if not penalty:
+                    raise
+                attempts.append(dict(method=method, position_penalty=penalty, reason=str(exc), checked=0))
+                continue
+            mounts = {frames[s]: xyz_record(baseline[s] if s == 'front' else
+                      anchor @ pose @ anchor.inverse() @ baseline[s]) for s, pose in zip(sides, poses)}
+            path.write_text(yaml.safe_dump({KIT: mounts}, sort_keys=False), encoding='utf-8')
+            rows = []
+            failed = []
+            for index, cap in enumerate(captures):
+                prefix = f'{method} · {cap.bag.name} · 复验 · '
+                callback = None if on_geometry is None else lambda c, p: on_geometry(index, c, p)
+                row = replay(cap, path, lambda msg: progress(prefix + msg), cancelled, on_geometry=callback)
+                rows.append(row)
+                if row['summary']['valid'] != 3 or len(row['pairs']) != 3 or any(
+                        m.get('quality') not in ('PASS','WARNING') or m.get('matched_planes') != 3
+                        for m in row['pairs'].values()):
+                    failed.append(cap.bag.name)
+                    if penalty:
+                        break
+            attempts.append(dict(method=method, position_penalty=penalty, support_weighting=weighted,
+                                 checked=len(rows), failed=failed))
+            if not failed or not penalty:
+                return poses, rows, dict(selected=method, attempts=attempts, accepted=not failed)
 
 
 def aggregate(pairs, expected):
@@ -275,6 +349,7 @@ def evaluate_request(req, settings, progress, cancelled):
         progress(f'{LABEL[side]}雷达滤波与提面')
         points = filter_points(clouds.clouds[side], fc)
         fitted = []
+        diagnostics = []
         if len(points) >= max(settings.plane_min_inliers, 3):
             fitted, _ = extract_planes(points, distance_threshold=settings.plane_threshold,
                                        min_inliers=settings.plane_min_inliers,
@@ -282,10 +357,15 @@ def evaluate_request(req, settings, progress, cancelled):
                                        max_iterations=settings.plane_max_iterations,
                                        min_plane_angle_deg=settings.plane_min_angle,
                                        min_plane_span=settings.plane_min_span,
-                                       max_plane_span=settings.plane_max_span, random_seed=0)
+                                       max_plane_span=settings.plane_max_span, random_seed=0, diagnostics=diagnostics)
+        else:
+            diagnostics.append(f"ROI 累计 {len(clouds.clouds[side])} 点，滤波后 {len(points)} 点，拟合至少需要 {max(settings.plane_min_inliers,3)} 点。请检查 ROI 与最少内点。")
         planes[side] = fitted
         entries = compute_plane_metrics(points, fitted)
-        sensor_stats[side] = dict(summary=summarize_plane_fit(side, entries), faces=entries,
+        summary = summarize_plane_fit(side, entries)
+        if len(entries) < 3 and diagnostics:
+            summary['reason'] += ' ' + ' '.join(dict.fromkeys(diagnostics))
+        sensor_stats[side] = dict(summary=summary, faces=entries,
                                   filtered_points=len(points))
     pairs = {}
     for a, b in combinations(req.active_sides(), 2):
@@ -372,7 +452,7 @@ def run_joint(selections, load_settings, progress, cancelled=lambda: False, *, o
             raise ValueError(f'{bag.name} / {Path(report).name}：{exc}') from exc
     first = captures[0]
     progress('正在联合拟合三个标定包的三面体')
-    poses = fit_joint(captures, cancelled)
+    poses, checked_rows, solver = select_joint(captures, first.sides, progress, cancelled)
     sensor_code = ''.join(side[0].upper() for side in first.sides)
     out = parent / f'{sensor_code}_result_report_{datetime.now():%Y%m%d_%H%M%S_%f}'
     out.mkdir()
@@ -386,11 +466,11 @@ def run_joint(selections, load_settings, progress, cancelled=lambda: False, *, o
         mounts[side] = dict(frame=first.frames[side], old=xyz_record(old), new=xyz_record(new),
                             delta_xyz_cm=delta.tolist(), displacement_cm=float(np.linalg.norm(delta)),
                             rotation_deg=float(np.rad2deg((old.rotation.inv()*new.rotation).magnitude())))
-    yaml_path = out / 'suggested_extrinsics.yaml'
+    yaml_path = out / ('suggested_extrinsics.yaml' if solver['accepted'] else 'candidate.yaml')
     yaml_path.write_text(yaml.safe_dump({KIT: extrinsics}, sort_keys=False), encoding='utf-8')
     result = dict(reference='front', baseline='/tf_static', validation='固定联合外参 N，在三个原始包重新累计、拟合平面并匹配',
                   validation_extrinsics=yaml_path.name,
-                  method='正交三面体等权点面拟合，soft-L1 15 mm', mounts=mounts, inputs=[], bags=[])
+                  solver=solver, method=solver['selected'], mounts=mounts, inputs=[], bags=[])
     for i, cap in enumerate(captures, 1):
         name = f'bag{i}_config.yaml'
         (out / name).write_text(cap.config_text, encoding='utf-8')
@@ -401,6 +481,9 @@ def run_joint(selections, load_settings, progress, cancelled=lambda: False, *, o
     comparison = dict(protocol='raw_bag_replay_v1',
                       method='每套外参分别对三个原始 bag 重新累计 ROI、滤波、提面和匹配，取三个包平均误差的极差。',
                       joint={}, single=[], errors=[], finished=False, compare_singles=compare_singles)
+    if not solver['accepted']:
+        comparison['errors'].append('三包最终复验未通过：' + '、'.join(solver['attempts'][-1]['failed']))
+    result['exported'] = solver['accepted']
     result['stability'] = comparison
     if compare_singles:
         progress('读取三份单包外参，准备重新累计')
@@ -461,7 +544,8 @@ def run_joint(selections, load_settings, progress, cancelled=lambda: False, *, o
                 comparison['errors'].append(f"{label}在包 {i} 有效配对 {data['summary']['valid']}/3")
 
     try:
-        replay_three(yaml_path, '联合解', result['bags'])
+        for cap, row in zip(captures, checked_rows):
+            result['bags'].append(dict(row, bag=cap.bag.name, bag_path=str(cap.bag), input_extrinsics=yaml_path.name))
         comparison['joint']['spread'] = replay_spread(result['bags'])
         persist()
         for i, single in enumerate(comparison['single'], 1):

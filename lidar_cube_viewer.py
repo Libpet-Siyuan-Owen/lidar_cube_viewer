@@ -18,7 +18,7 @@ from datetime import datetime
 
 import numpy as np
 import yaml
-from lidar_cube_correction import attach_extrinsic_report
+from lidar_cube_correction import attach_extrinsic_report, validate_single_capture
 from lidar_cube_core import (
     AccumulationRequest, AccumulationResult, COLORS, DEFAULT_BAG,
     ALL_SIDES, KIT, MAPPING_SIDES, WORKSPACE, accumulate,
@@ -1849,6 +1849,12 @@ class Viewer:
             return
         clouds = self.processed_clouds if self.filter_display and self.processed_clouds is not None else self.result.clouds
         source_name = '滤波后' if self.filter_display and self.processed_clouds is not None else '原始'
+        applied = self.applied_filter if clouds is self.processed_clouds else FilterConfig(0., 0, 0.)
+        self.fit_settings = ViewerSettings(self.result.request, analysis_voxel=applied.voxel_size,
+            filter_radius=applied.neighbor_radius, filter_min_neighbors=applied.min_neighbors,
+            plane_threshold=threshold, plane_min_inliers=min_inliers, plane_max_planes=max_planes,
+            plane_max_iterations=max_iterations, plane_min_angle=min_angle,
+            plane_max_span=max_span, plane_min_span=min_span)
         self.processing = True
         self.save_result_button.state(['disabled'])
         self.filter_button.state(['disabled'])
@@ -1928,7 +1934,7 @@ class Viewer:
         try:
             filtered = {side: filter_points(points, config)
                         for side, points in self.result.clouds.items()}
-            self.filter_events.put(('filtered', filtered))
+            self.filter_events.put(('filtered', (filtered, config)))
         except Exception as error:
             self.filter_events.put(('filter_error', str(error)))
 
@@ -1937,7 +1943,7 @@ class Viewer:
             while True:
                 kind, payload = self.filter_events.get_nowait()
                 if kind == 'filtered':
-                    self.processed_clouds = payload
+                    self.processed_clouds, self.applied_filter = payload
                     self.filter_display = True
                     self.plane_results = None
                     self.metrics_results = None
@@ -1984,7 +1990,8 @@ class Viewer:
             try:
                 metrics['extrinsic_corrections'] = compute_extrinsic_corrections(planes, metrics)
                 metrics['saved_pair_validation'] = {}
-                front_kit = attach_extrinsic_report(result, planes, metrics)
+                front_kit = (validate_single_capture(result, planes, metrics, self.fit_settings, self.cancelled.is_set)
+                             if len(result.request.active_sides()) == 3 else attach_extrinsic_report(result, planes, metrics))
                 with tempfile.TemporaryDirectory(dir=parent, prefix='.cube_report_') as stage:
                     staged = Path(stage) / 'report'
                     staged.mkdir()

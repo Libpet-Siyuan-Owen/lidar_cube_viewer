@@ -9,7 +9,7 @@ import yaml
 from scipy.spatial.transform import Rotation
 
 from lidar_cube_core import KIT, MAPPING_SIDES
-from lidar_cube_joint import (JOINT_CONFIG, aggregate, fit_joint, load_joint_config,
+from lidar_cube_joint import (JOINT_CONFIG, aggregate, select_joint, load_joint_config,
                               prepare, read_json, replay, xyz_record)
 
 SIX_CONFIG = 'six_fit_config.yaml'
@@ -79,7 +79,7 @@ def run_six(paths, load_settings, progress, cancelled, output_parent=None):
     if not parent.is_dir():
         raise ValueError(f'结果保存目录不存在：{parent}')
     progress('六包联合求解中，锁定前雷达，共同求解左、右和顶部安装外参')
-    poses = fit_joint(captures, cancelled, MAPPING_SIDES)
+    poses, checked_rows, solver = select_joint(captures, MAPPING_SIDES, progress, cancelled)
     front = baseline['front']
     mounts, joint = {}, {}
     for side, correction in zip(MAPPING_SIDES, poses):
@@ -97,7 +97,7 @@ def run_six(paths, load_settings, progress, cancelled, output_parent=None):
     candidates = [{**fixed, frames['top']: t} for t in (a, b, midpoint(a, b))] + [joint]
     group_paths = [str(p) for p in paths]
     result = dict(group_configs=group_paths, reference='front', baseline='/tf_static', inputs=inputs,
-                  method='六摆位独立正交三面体，共享左、右、顶安装外参；逐面等权 soft-L1 15 mm',
+                  method=solver['selected'], solver=solver,
                   mounts=mounts, corner_comparison=[], candidates=[], errors=[])
     out = parent / f'FLRT_result_report_{datetime.now():%Y%m%d_%H%M%S_%f}'
     with TemporaryDirectory(prefix='.six_fit_', dir=parent) as temp:
@@ -114,7 +114,8 @@ def run_six(paths, load_settings, progress, cancelled, output_parent=None):
                     raise InterruptedError('六包联合拟合已停止')
                 prefix = f'{label}（{i}/4）· 情况{k}/6 · '
                 try:
-                    row = replay(cap, file, lambda m: progress(prefix + m), cancelled)
+                    row = (dict(checked_rows[k-1], input_extrinsics=file.name) if i == 4 else
+                           replay(cap, file, lambda m: progress(prefix + m), cancelled))
                 except InterruptedError:
                     raise
                 except Exception as exc:

@@ -19,7 +19,12 @@ from v02_batch import (MACHINE_FILE, PARAMS, ROI_FILE, SLOTS, calibrate, corners
                        preview, valid_bounds, write_yaml)
 
 POSES = {'F3d':'正前 3 m','0.3L':'左偏 0.3 m','0.3R':'右偏 0.3 m'}
-FIELDS = ('内点阈值 m','最少内点','最多平面','迭代次数','最小夹角 °','最小跨度 m','最大跨度 m')
+FIELDS = (
+    ('plane_threshold', '内点阈值 m'), ('plane_min_inliers', '最少内点'),
+    ('plane_max_iterations', '迭代次数'), ('plane_min_angle', '最小夹角 °'),
+    ('plane_max_span', '最大跨度 m'), ('analysis_voxel', '降采样体素 m'),
+    ('filter_radius', '滤波邻域半径 m'), ('filter_min_neighbors', '邻域最少点数'),
+)
 EDGES=[(i,j) for i,j in combinations(range(8),2) if (i^j) in (1,2,4)]
 
 
@@ -59,8 +64,9 @@ class BatchViewer:
         for idx,k in enumerate(SLOTS):self.axes[k]=self.figure.add_subplot(2,3,idx+1)
         ttk.Label(self.roi,text='点击预览可调整框或更换包。虚线为搜索范围，绿色实线为累计范围。').pack(anchor='w',padx=12)
         self.params={k:tk.StringVar(value=str(v)) for k,v in PARAMS.items()};self.param_area=ttk.Frame(self.roi);self.fields=ttk.Frame(self.param_area)
-        self.param_area.pack(fill='x',padx=8);ttk.Button(self.param_area,text='平面拟合参数（六包共用）',command=self.toggle_params).pack(anchor='w')
-        for i,((key,var),label) in enumerate(zip(self.params.items(),FIELDS)):
+        self.param_area.pack(fill='x',padx=8);ttk.Button(self.param_area,text='平面拟合和滤波参数（六包共用）',command=self.toggle_params).pack(anchor='w')
+        for i, (key, label) in enumerate(FIELDS):
+            var = self.params[key]
             ttk.Label(self.fields,text=label).grid(row=0,column=i,padx=3);ttk.Entry(self.fields,textvariable=var,width=10).grid(row=1,column=i,padx=3)
         bottom=ttk.Frame(self.roi,padding=8);bottom.pack(fill='x');self.start_button=ttk.Button(bottom,text='确认全部并开始标定',command=self.start);self.start_button.pack(side='left')
         for title,item in [('打开结果目录',''),('打开最终外参','suggested_extrinsics.yaml')]:
@@ -69,6 +75,7 @@ class BatchViewer:
         self.results = Results(self.roi)
         self.results.pack(side='bottom', fill='x', padx=8, pady=(0, 6))
         self.run_started = False
+        self.preparing_preview = False
         root.protocol('WM_DELETE_WINDOW',self.close);self.refresh();root.after(100,self.poll)
 
     def lock_view(self):
@@ -111,7 +118,21 @@ class BatchViewer:
     def report(self, message):
         self.status.set(message)
 
+    def pending_slots(self):
+        return [slot for slot in SLOTS if slot not in self.models or self.models[slot].manual]
+
+    def update_start_button(self):
+        if self.busy:
+            text = '正在准备预览…' if self.preparing_preview else '正在标定…'
+        elif self.parent is None:
+            text = '请先选择数据目录'
+        else:
+            pending = self.pending_slots()
+            text = f'检查待确认摆位（{len(pending)} 个）' if pending else '确认全部并开始标定'
+        self.start_button.configure(text=text, state='disabled' if self.busy or self.parent is None else 'normal')
+
     def refresh(self):
+        self.update_start_button()
         for k,ax in self.axes.items():
             p=self.models.get(k);ax.clear();ax.set_axis_on()
             if p:draw(ax,p,p.bounds)
@@ -169,7 +190,10 @@ class BatchViewer:
                 try:self.events.put(('preview',(k,preview(path,k),'')))
                 except Exception as exc:self.events.put(('preview',(k,None,str(exc))))
             self.events.put(('ready',None))
-        self.busy=True;Thread(target=work,daemon=True).start()
+        self.preparing_preview = True
+        self.busy=True
+        self.start_button.configure(text='正在准备预览…', state='disabled')
+        Thread(target=work,daemon=True).start()
 
     def poll(self):
         try:
@@ -189,16 +213,27 @@ class BatchViewer:
                         self.report(f'{k} · 预览失败　{msg}')
                     self.refresh()
                 elif key=='ready':
-                    self.busy=False;need=[k for k in SLOTS if k not in self.models or self.models[k].manual];self.report(self.config_notice + ('请点击检查 '+', '.join(need) if need else '六个摆位已就绪，请核对绿色累计框。'))
+                    self.busy=False
+                    self.preparing_preview=False
+                    self.update_start_button()
+                    need=self.pending_slots()
+                    self.report(self.config_notice + ('请点击检查 '+', '.join(need) if need else '六个摆位已就绪，请核对绿色累计框。'))
                 elif key=='done':
-                    self.busy=False;self.output,fail=value;self.report('已导出四雷达外参  '+str(self.output) if not fail else '复验失败，请调整后重试  '+', '.join(fail)+'　结果目录 '+str(self.output))
+                    self.busy=False
+                    self.update_start_button()
+                    self.output,fail=value;self.report('已导出四雷达外参  '+str(self.output) if not fail else f'最终复验有 {len(fail)} 处未通过。{fail[0]}　全部见“失败原因”。结果目录 {self.output}')
                     if not fail:
                         try:
                             self.workspace_report = self.view_report = SceneReport(self.output)
                             self.mode.configure(state='readonly')
                         except (ValueError, OSError, KeyError, TypeError) as exc:
                             self.report(f'无法打开 3D 结果：{exc}')
-                elif key=='error':self.busy=False;self.report(str(value))
+                elif key=='error':
+                    self.busy=False
+                    self.update_start_button()
+                    self.results.current.add_issue(str(value))
+                    self.results.update_issues()
+                    self.report(str(value))
         except Empty:pass
         self.root.after(100,self.poll)
 
@@ -260,7 +295,10 @@ class BatchViewer:
                 return
             self.models[k] = updated
             self.lock_view()
-            self.report(f'{k} · 已人工确认并保存 ROI');self.output=None;self.refresh();win.destroy()
+            remaining = self.pending_slots()
+            action = '待确认：' + '、'.join(remaining) if remaining else '六个摆位已就绪，可以开始标定'
+            self.report(f'{k} · 已保存 ROI。{action}')
+            self.output=None;self.refresh();win.destroy()
         ttk.Button(bar,text='确认此 ROI',command=confirm).pack(side='right');return win
 
     @staticmethod
@@ -268,8 +306,15 @@ class BatchViewer:
 
     def start(self):
         if self.busy or self.raise_roi_editor():return
-        need=[k for k in SLOTS if k not in self.models or self.models[k].manual]
-        if need:self.report('请先点击并确认 '+', '.join(need));return
+        if self.parent is None:
+            self.report('请先选择数据目录')
+            return
+        need = self.pending_slots()
+        if need:
+            first = need[0]
+            self.report('待确认摆位：' + '、'.join(need) + '。正在打开 ' + first)
+            self.edit(first)
+            return
         previews=[self.models[k] for k in SLOTS]
         try:
             params={k:type(v)(self.params[k].get()) for k,v in PARAMS.items()};validate_params(params)
@@ -280,7 +325,9 @@ class BatchViewer:
             self.results.new(self.parent.name)
         self.lock_view()
         self.run_started = True
-        self.output=None;self.busy=True;self.report(f'开始新一轮标定 · 六个 ROI 已保存，内点阈值 {params["plane_threshold"]} m，迭代 {params["plane_max_iterations"]} 次')
+        self.output=None;self.busy=True
+        self.update_start_button()
+        self.report(f'开始新一轮标定 · 六个 ROI 已保存，内点阈值 {params["plane_threshold"]} m，迭代 {params["plane_max_iterations"]} 次')
         def work():
             try:self.events.put(('done',calibrate(previews,params,self.parent,lambda m:self.events.put(('progress',m)),self.stop.is_set,self.cache,on_result=lambda kind, payload:self.events.put((kind,payload)))))
             except Exception as exc:self.events.put(('error',str(exc)))
@@ -294,6 +341,9 @@ class BatchViewer:
 
 
 def validate_params(params):
+    for key, label in FIELDS:
+        if key in ('analysis_voxel', 'filter_radius', 'filter_min_neighbors') and not (np.isfinite(params[key]) and params[key] > 0):
+            raise ValueError(f'{label}必须大于零。')
     if not all(np.isfinite(v) for v in params.values()) or not (params['plane_threshold']>0 and params['plane_min_inliers']>=3 and params['plane_max_planes']==3 and params['plane_max_iterations']>0 and 0<params['plane_min_angle']<90 and 0<=params['plane_min_span']<params['plane_max_span']):
         raise ValueError('请检查拟合参数；三面体需要 3 个面，最小跨度应小于最大跨度。')
 

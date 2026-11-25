@@ -23,7 +23,7 @@ def _transform_report(transform, parent_frame, child_frame):
         'quaternion_xyzw': transform.rotation.as_quat().tolist(),
     }
 
-def attach_extrinsic_report(result, planes, metrics):
+def attach_extrinsic_report(result, planes, metrics, pair_weights=None):
     """Attach pairwise corrections and refine a selected three-radar loop.
 
     Pairwise plane fitting remains the source of the three observations.
@@ -140,7 +140,7 @@ def attach_extrinsic_report(result, planes, metrics):
 
     selected = tuple(result.request.active_sides())
     if len(selected) == 3 and 'front' in selected:
-        optimization = optimize_three_radar_extrinsics(observed_pairs, selected)
+        optimization = optimize_three_radar_extrinsics(observed_pairs, selected, pair_weights=pair_weights)
         # relative_final 是 first <- second。还原成初始公共坐标中的修正，
         # 才能用原来累计的内点复验同一组对应面，尤其是非前雷达配对。
         final_scores = {}
@@ -234,3 +234,50 @@ def attach_extrinsic_report(result, planes, metrics):
                     planes[first], planes[second], pair['matches'], delta.rotation.as_matrix(),
                     delta.translation, metrics['thresholds']['overlap_distance_m'])
     return front_kit
+
+
+def validate_single_capture(result, planes, metrics, settings, cancelled):
+    """Use the weighted loop only if the usual three-lidar solution fails raw replay."""
+    from dataclasses import replace
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+    import yaml
+    from lidar_cube_joint import evaluate_request, face_weight
+
+    attempts = []
+    with TemporaryDirectory(prefix='cube_single_') as tmp:
+        path = Path(tmp) / 'candidate.yaml'
+        for weighted in (False, True):
+            weights = None
+            if weighted:
+                weights = {key: min((face_weight(p.points) for s in key.split('-') for p in planes[s]), default=1.)
+                           for key in metrics['pairs']}
+            front = attach_extrinsic_report(result, planes, metrics, weights)
+            joint = metrics.get('three_radar_optimization', {})
+            method = '弱面闭环降权' if weighted else '原三雷达闭环'
+            if not joint.get('available'):
+                attempts.append(dict(method=method, reason=joint.get('reason', '无法形成候选外参')))
+                if not front or not all(c.get('available') for c in metrics['extrinsic_corrections'].values()):
+                    break
+                continue
+            mounts = [front] + [entry['new_sensor_kit'] for entry in metrics['extrinsics'].values() if 'new_sensor_kit' in entry]
+            if len(mounts) != 3:
+                raise ValueError('三雷达候选外参不完整')
+            path.write_text(yaml.safe_dump({KIT: {m['child_frame']: {k:m[k] for k in ('x','y','z','roll','pitch','yaw')} for m in mounts}},sort_keys=False))
+            req = replace(result.request, extrinsics_source='yaml', extrinsics=str(path))
+            _, _, _, pairs = evaluate_request(req, settings, lambda _: None, cancelled)
+            failed = [key for key,m in pairs.items() if m['quality'] not in ('PASS','WARNING') or m.get('matched_planes') != 3]
+            attempts.append(dict(method=method, failed=failed, weights=weights))
+            if not failed:
+                metrics['saved_pair_validation'] = pairs
+                metrics['single_solver'] = dict(selected=method, attempts=attempts)
+                return front
+        metrics['single_solver'] = dict(selected=None, attempts=attempts)
+        joint = metrics.get('three_radar_optimization')
+        if joint:
+            joint.update(available=False, success=False, quality='FAIL', reason='单包候选未通过验证：' + str(attempts[-1]))
+        metrics['saved_pair_validation'] = {}
+        for entry in metrics.get('extrinsics', {}).values():
+            if isinstance(entry,dict) and 'new_sensor_kit' in entry:
+                entry['candidate_sensor_kit'] = entry.pop('new_sensor_kit')
+        return front

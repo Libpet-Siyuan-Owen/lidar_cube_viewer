@@ -10,6 +10,7 @@ from scipy.spatial import ConvexHull, QhullError
 from scipy.spatial.transform import Rotation
 from lidar_cube_core import (AccumulationRequest, Bag, Transform, PointCloud2, deserialize_message,
                              sensor_mounts, static_edges)
+from v02_parameters import PARAMS
 from lidar_cube_joint import evaluate_request
 from lidar_cube_viewer import ViewerSettings
 
@@ -142,8 +143,7 @@ class SceneReport:
                 return Scene.read(path)
         if not bag_path.is_dir():
             raise FileNotFoundError(f'此视图尚无缓存，需要原始包 {bag_path}')
-        settings = ViewerSettings(req, analysis_voxel=.02, filter_radius=.06, filter_min_neighbors=5,
-                                  **self.data['params'])
+        settings = ViewerSettings(req, **{**PARAMS, **self.data['params']})
         clouds, planes, _, _ = evaluate_request(req, settings, lambda _: None, cancelled)
         if cancelled():
             raise InterruptedError()

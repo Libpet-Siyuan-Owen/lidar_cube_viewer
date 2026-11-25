@@ -12,13 +12,12 @@ from scipy.spatial import cKDTree
 from lidar_cube_core import (Bag, BASE, FRONT, KIT, MAPPING_SIDES, AccumulationRequest, Transform,
     PointCloud2, TFMessage, deserialize_message, static_edges, lookup, Timeline, stamp_ns, read_xyz, thin,
     find_chain, compose_chain)
-from lidar_cube_joint import Capture, fit_joint, evaluate_request, replay, correspondence, xyz_record
+from lidar_cube_joint import Capture, select_joint, evaluate_request, replay, correspondence, xyz_record
 from lidar_cube_viewer import ViewerSettings
+from v02_parameters import PARAMS
 from v02_scene import Scene, pack_edges, transform_key
 
 SLOTS = tuple(f'{group}_{pose}' for group in ('FLT','FRT') for pose in ('F3d','0.3L','0.3R'))
-PARAMS = dict(plane_threshold=.02, plane_min_inliers=20, plane_max_planes=3, plane_max_iterations=100,
-              plane_min_angle=80., plane_min_span=0., plane_max_span=2.)
 ROI_FILE = 'V02_ROI.yaml'
 MACHINE_FILE = 'V02_machine.yaml'
 
@@ -197,10 +196,14 @@ def log_bag_result(log, slot, stage, stats, pairs):
         corner, normal = metric.get('corner_distance_m'), metric.get('normal_error_deg')
         details = (f'交点距离 {corner*100:.2f} cm，平均法向夹角 {normal:.2f}°'
                    if corner is not None and normal is not None else metric.get('reason') or '配对不完整')
+        reason = metric.get('reason') or metric.get('failure_detail')
+        if reason and reason not in details:
+            details += '。' + reason
         log(f"{slot} · {stage} · {name} {metric['quality']}　{details}")
 
 
 def calibrate(previews,params,parent,progress,cancelled,cache=None,log=None,on_result=None):
+    params = {**PARAMS, **params}
     if log is None:
         log = progress
     scenes = {}
@@ -230,7 +233,7 @@ def calibrate(previews,params,parent,progress,cancelled,cache=None,log=None,on_r
                 initial.append(record)
                 continue
             req=AccumulationRequest(str(p.bag),'',valid_bounds(p.bounds),calibration_sides=sides)
-            settings=ViewerSettings(req,analysis_voxel=.02,filter_radius=.06,filter_min_neighbors=5,**params);settings.validate()
+            settings=ViewerSettings(req, **params);settings.validate()
             clouds,planes,stats,pairs=evaluate_request(req,settings,lambda s:progress(p.slot+' · '+s),cancelled)
             counts = '，'.join(f"{RADAR_NAMES[side]} {x['used_frames']} 帧/{x['roi_points']} 点"
                               for side, x in clouds.stats.items())
@@ -239,10 +242,10 @@ def calibrate(previews,params,parent,progress,cancelled,cache=None,log=None,on_r
             if on_result:
                 on_result('bag', (p.slot, '初始', stats, pairs, clouds.stats))
             for side in sides:
-                if stats[side]['summary']['quality']=='FAIL' or len(planes[side])!=3:raise ValueError(f'{side} 雷达三面拟合失败，请检查 ROI 或参数')
+                if stats[side]['summary']['quality']=='FAIL' or len(planes[side])!=3:raise ValueError(f"{RADAR_NAMES[side]}雷达初始平面拟合失败。{stats[side]['summary']['reason']}")
             order=[[0,1,2]]+[correspondence({'pairs':pairs},'front',s) for s in sides[1:]]
             cross=correspondence({'pairs':pairs},sides[1],sides[2]);
-            if [cross[i] for i in order[1]]!=order[2]:raise ValueError('三组对应面不一致')
+            if [cross[i] for i in order[1]]!=order[2]:raise ValueError(f'三组面对应不一致。以前雷达为序，两条路径分别得到 {[i+1 for i in order[2]]} 和 {[cross[i]+1 for i in order[1]]}，请核对三组靶面。')
             fr=clouds.provenance['sensor_frames'];edges=static_edges(Bag(p.bag));old={s:lookup(edges,KIT,fr[s]) for s in sides}
             for s in sides:
                 if s in baseline:
@@ -256,7 +259,15 @@ def calibrate(previews,params,parent,progress,cancelled,cache=None,log=None,on_r
             caps.append(Capture(p.bag,None,'',settings,sides,fr,old,patches,{}));initial.append(dict(slot=p.slot,sensors=stats,pairs=pairs,frames=clouds.stats));del clouds
             if cache is not None:cache[p.slot]=(signature,caps[-1],initial[-1],scenes[p.slot],sources[p.slot])
         except Exception as exc:raise ValueError(f'{p.slot} / {p.bag.name}：{exc}') from exc
-    progress('六包四雷达联合拟合');poses=fit_joint(caps,cancelled,MAPPING_SIDES);front=baseline['front']; mounts={}
+    progress('六包四雷达联合拟合')
+    checked_scenes = {}
+    def remember(index, clouds, planes):
+        checked_scenes[previews[index].slot] = Scene.capture(clouds, planes)
+    try:
+        poses, checked_rows, solver = select_joint(caps, MAPPING_SIDES, progress, cancelled, remember)
+    except (ValueError, np.linalg.LinAlgError) as exc:
+        raise ValueError(f'六包四雷达联合拟合失败。{exc}') from exc
+    front=baseline['front']; mounts={}
     log('六包联合求解完成，前雷达锁定')
     for side,correction in zip(MAPPING_SIDES,poses):
         new=baseline[side] if side=='front' else front@correction@front.inverse()@baseline[side]
@@ -270,18 +281,16 @@ def calibrate(previews,params,parent,progress,cancelled,cache=None,log=None,on_r
         log(f'{RADAR_NAMES[side]}雷达 · 相对 /tf_static 安装修正 {displacement_cm:.2f} cm，{angle_deg:.2f}°')
     with TemporaryDirectory(dir=parent,prefix='.v02_') as tmp:
         stage=Path(tmp)/'result';stage.mkdir();candidate=stage/'candidate.yaml';write_yaml(candidate,{KIT:mounts});rows=[];failures=[]
-        for p,cap in zip(previews,caps):
+        for p,row in zip(previews,checked_rows):
             try:
                 folder = stage/'clouds_3d'/p.slot
                 scenes[p.slot].save(folder/'initial.npz')
-                def save_joint(clouds, planes):
-                    scene = Scene.capture(clouds, planes)
-                    scene.save(folder/'joint.npz')
-                    from scipy.spatial.transform import Rotation
-                    mounts_used = {s: Transform(Rotation.from_quat(t['quaternion_xyzw']), np.array(t['translation']))
-                                   for s, t in scene.metadata['mounts'].items()}
-                    sources[p.slot]['joint'] = transform_key(mounts_used)
-                row=replay(cap,candidate,lambda msg:progress(p.slot+' · 复验 · '+msg),cancelled,on_geometry=save_joint)
+                scene = checked_scenes[p.slot]
+                scene.save(folder/'joint.npz')
+                from scipy.spatial.transform import Rotation
+                mounts_used = {s: Transform(Rotation.from_quat(t['quaternion_xyzw']), np.array(t['translation']))
+                               for s,t in scene.metadata['mounts'].items()}
+                sources[p.slot]['joint'] = transform_key(mounts_used)
             except Exception as exc:
                 raise RuntimeError(f'{p.slot} / {p.bag.name} 复验失败：{exc}') from exc
             rows.append(row)
@@ -289,10 +298,12 @@ def calibrate(previews,params,parent,progress,cancelled,cache=None,log=None,on_r
             if on_result:
                 on_result('bag', (p.slot, '复验', row['sensors'], row['pairs'], row['frames']))
             for key,m in row['pairs'].items():
-                if m.get('quality') not in ('PASS','WARNING') or m.get('matched_planes')!=3:failures.append(p.slot+' '+key)
+                if m.get('quality') not in ('PASS','WARNING') or m.get('matched_planes')!=3:
+                    reason = m.get('reason') or m.get('failure_detail') or f"仅匹配 {m.get('matched_planes',0)}/3 个面"
+                    failures.append(f'{p.slot} {key} · {reason}')
             if row['summary']['valid']!=3 and not any(f.startswith(p.slot+' ') for f in failures):failures.append(p.slot+' 配对不完整')
         inputs=[dict(slot=p.slot,bag=p.bag.name,bounds=p.bounds.tolist()) for p in previews];write_yaml(stage/'batch_config.yaml',dict(params=params,cases=inputs));
-        (stage/'validation.json').write_text(json.dumps(dict(cases=inputs,params=params,initial=initial,validation=rows,failures=failures,scene_sources=sources,mount_changes=changes),ensure_ascii=False,indent=2,allow_nan=False));
+        (stage/'validation.json').write_text(json.dumps(dict(cases=inputs,params=params,solver=solver,initial=initial,validation=rows,failures=failures,scene_sources=sources,mount_changes=changes),ensure_ascii=False,indent=2,allow_nan=False));
         if not failures:candidate.rename(stage/'suggested_extrinsics.yaml')
         out=parent/('FLRT_V02_result_report_'+datetime.now().strftime('%Y%m%d_%H%M%S_%f'));stage.rename(out)
     return out,failures

@@ -189,7 +189,19 @@ def summarize_plane_fit(side, entries):
     if all(np.isfinite(rms)):
         summary['max_plane_rms_m'] = float(max(rms))
     if any(entry['quality'] == 'FAIL' for entry in entries):
-        summary['reason'] = f'{side} 存在质量为 FAIL 的拟合面。'
+        limits = (("rms_m", "RMS", .08, 100, "cm"), ("p95_point_plane_distance_m", "P95", .20, 100, "cm"))
+        reasons = []
+        for face in entries:
+            if face['quality'] != 'FAIL':
+                continue
+            issues = [f'{label} {face[k]*scale:.2f} {unit}（上限 {limit*scale:g}）'
+                      for k,label,limit,scale,unit in limits if not np.isfinite(face[k]) or face[k] > limit]
+            if face['inlier_ratio'] < .005:
+                issues.append(f"内点占比 {face['inlier_ratio']:.2%} 低于 0.5%")
+            if max(face['span_m']) > 1.50:
+                issues.append(f"跨度 {max(face['span_m']):.2f} m 超过 1.50 m")
+            reasons.append(f"P{face['plane_index']} " + '、'.join(issues))
+        summary['reason'] = '；'.join(reasons)
     else:
         summary['quality'] = 'WARNING' if any(e['quality'] == 'WARNING' for e in entries) else 'PASS'
     return summary
@@ -332,8 +344,12 @@ def _match_trihedra(planes_a, planes_b):
     allowed = dots >= np.cos(np.radians(25.0)) - 1e-12
     feasible = [order for order in permutations(range(3))
                 if all(allowed[i, j] for i, j in enumerate(order))]
+    if not feasible:
+        best = min(max(np.degrees(np.arccos(np.clip(dots[i,j], 0, 1))) for i,j in enumerate(order))
+                   for order in permutations(range(3)))
+        return [], f'无法一一对应。最佳排列仍有一对法向夹角 {best:.2f}°，逐面上限 25°。请核对初始外参与三个靶面。'
     if len(feasible) != 1:
-        return [], ('25° 内没有完整三面对应。' if not feasible else '25° 内有多套三面对应，无法唯一匹配。')
+        return [], ( '25° 内有多套三面对应，无法唯一匹配。')
     return list(enumerate(feasible[0])), ''
 
 
@@ -396,7 +412,24 @@ def _score_matches(planes_a, planes_b, indices, overlap_distance):
     corner_b = trihedral_corner(planes_b)
     corner_distance = (float(np.linalg.norm(corner_a - corner_b))
                        if corner_a is not None and corner_b is not None else None)
+    problems = []
+    for match in matches:
+        if match['quality'] != 'FAIL':
+            continue
+        exceeded = []
+        for key, label, limit, scale, unit in zip(
+                ('normal_error_deg', 'point_to_plane_rms_m', 'point_to_plane_p95_m'),
+                ('法向夹角', '双向点面 RMS', '双向点面 P95'),
+                PAIR_WARNING_LIMITS, (1, 100, 100), ('°', 'cm', 'cm')):
+            value = match[key]
+            if not np.isfinite(value):
+                exceeded.append(label + '无有效测量')
+            elif value > limit:
+                exceeded.append(f'{label} {value*scale:.2f}{unit} 超过 {limit*scale:g}{unit}')
+        problems.append(f"P{match['plane_a_index']}↔P{match['plane_b_index']} " +
+                        (match.get('reason') or '、'.join(exceeded)))
     return {
+        'failure_detail': '；'.join(problems),
         'corner_distance_m': corner_distance,
         'matched_planes': len(matches),
         'normal_error_deg': float(np.mean(normal_errors)),
@@ -876,7 +909,7 @@ def compute_extrinsic_corrections(plane_results, metrics):
 
 def extract_plane(points, distance_threshold=0.015, max_iterations=500,
                   min_inliers=100, random_seed=0, forbidden_normals=None,
-                  min_plane_angle_deg=30.0):
+                  min_plane_angle_deg=30.0, diagnostics=None):
     """RANSAC 多平面提取的单平面框架。
 
     当前函数先提取一个平面。调用者可以删除返回的内点后再次调用，
@@ -898,6 +931,8 @@ def extract_plane(points, distance_threshold=0.015, max_iterations=500,
     rng = np.random.default_rng(random_seed)
     best_result = None
     best_count = 0
+    valid_models = 0
+    angle_rejected = 0
 
     for _ in range(max_iterations):
         # TODO 1: 随机选择三个不同的点。
@@ -912,8 +947,10 @@ def extract_plane(points, distance_threshold=0.015, max_iterations=500,
 
         # 多平面提取时，跳过与已接受平面近似平行的候选，避免把同一个
         # 大平面切成几个局部区域后误报成多个平面。
+        valid_models += 1
         if any(abs(float(normal @ previous)) >= normal_dot_limit
                for previous in forbidden_normals):
+            angle_rejected += 1
             continue
 
         # TODO 2: 计算所有点到当前候选平面的距离。
@@ -929,6 +966,13 @@ def extract_plane(points, distance_threshold=0.015, max_iterations=500,
             best_result = PlaneResult(normal, offset, inlier_mask, residuals)
 
     if best_result is None or best_count < min_inliers:
+        if diagnostics is not None:
+            if not valid_models:
+                diagnostics.append(f"{max_iterations} 次采样均未得到非共线三点，请检查靶面覆盖。")
+            elif valid_models == angle_rejected:
+                diagnostics.append(f"{valid_models} 个有效候选全部未达到最小夹角 {min_plane_angle_deg:g}°，请检查面方向与覆盖。")
+            else:
+                diagnostics.append(f"剩余 {len(points)} 点。在最小夹角 {min_plane_angle_deg:g}°、内点距离 {distance_threshold*100:g} cm 下，本轮采样的最佳候选有 {best_count} 个内点，低于最少内点 {min_inliers}。请检查弱面的 ROI 覆盖，再评估最少内点设置。")
         return None
 
     # TODO 5: 可选的精修步骤。
@@ -940,7 +984,7 @@ def extract_plane(points, distance_threshold=0.015, max_iterations=500,
 def extract_planes(points, distance_threshold=0.015, max_iterations=500,
                    min_inliers=100, max_planes=3, random_seed=0,
                    min_plane_angle_deg=30.0, max_plane_span=None,
-                   min_plane_span=0.0):
+                   min_plane_span=0.0, diagnostics=None):
     """迭代提取多个平面，返回平面结果列表和剩余点云。
 
     每轮只在 remaining_points 中寻找一个平面，提取成功后删除该平面的
@@ -965,6 +1009,8 @@ def extract_planes(points, distance_threshold=0.015, max_iterations=500,
         if len(planes) >= max_planes:
             break
         if len(remaining_points) < max(3, min_inliers):
+            if diagnostics is not None:
+                diagnostics.append(f"只剩 {len(remaining_points)} 点，至少需要 {max(3, min_inliers)} 点。请检查 ROI 和最少内点。")
             break
 
         # 使用不同的随机种子，避免每一轮重复同一组随机序列。
@@ -974,6 +1020,7 @@ def extract_planes(points, distance_threshold=0.015, max_iterations=500,
             max_iterations=max_iterations,
             min_inliers=min_inliers,
             random_seed=random_seed + plane_index,
+            diagnostics=diagnostics,
             forbidden_normals=accepted_normals,
             min_plane_angle_deg=min_plane_angle_deg,
         )
@@ -989,6 +1036,9 @@ def extract_planes(points, distance_threshold=0.015, max_iterations=500,
         normal_dot_limit = np.cos(np.deg2rad(min_plane_angle_deg))
         if any(abs(float(refined.normal @ previous)) >= normal_dot_limit
                for previous in accepted_normals):
+            if diagnostics is not None:
+                angle = np.degrees(np.arccos(np.clip(max(abs(refined.normal @ n) for n in accepted_normals), 0, 1)))
+                diagnostics.append(f"精修后与已选面夹角 {angle:.1f}°，要求大于 {min_plane_angle_deg:g}°。")
             # 精修可能让单个候选越过夹角门槛。保留剩余点，按循环上限换种子再试。
             continue
 
@@ -1009,11 +1059,15 @@ def extract_planes(points, distance_threshold=0.015, max_iterations=500,
 
         if (max_plane_span is not None
                 and max(plane_spans(refined.points)) > max_plane_span):
+            if diagnostics is not None:
+                diagnostics.append(f"候选面跨度 {max(plane_spans(refined.points)):.3f} m 超过最大跨度 {max_plane_span:g} m，请检查背景与 ROI。")
             # 当前候选面明显大于目标面，通常是 ROI 中的背景面。
             # 删除该背景面的内点后继续搜索，避免第一个背景面导致结果为空。
             remaining_points = remaining_points[~refined_mask]
             continue
         if min_plane_span > 0 and min(plane_spans(refined.points)) < min_plane_span:
+            if diagnostics is not None:
+                diagnostics.append(f"候选面短边 {min(plane_spans(refined.points)):.3f} m 小于最小跨度 {min_plane_span:g} m，请检查面覆盖与最小跨度。")
             # The candidate may be a narrow background strip or a partial
             # return.  Remove it and continue searching for a wider target
             # plane in the remaining ROI points.

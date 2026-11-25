@@ -14,8 +14,16 @@ TITLES = (('最大直角偏差（°）', '最大单面拟合 RMS（mm）'),
           ('角点距离（cm）', '对应面平均法向夹角（°）'))
 
 
-def match_detail(key, match):
-    details = [match['quality']]
+def initial_deviation(stage, match):
+    if stage != '初始' or match['quality'] != 'FAIL' or match.get('matched_planes') != 3:
+        return False
+    faces = match.get('matches', [])
+    return (len(faces) == 3 and
+            all({m.get(k) for m in faces} == {1, 2, 3} for k in ('plane_a_index', 'plane_b_index')))
+
+
+def match_detail(key, match, stage=None):
+    details = ['初始偏差超限 · 三面已对应，可继续求解' if initial_deviation(stage, match) else match['quality']]
     if match.get('reason'):
         details.append(match['reason'])
     a, b = (RADAR_NAMES[s] for s in key.split('-'))
@@ -60,7 +68,7 @@ def chart_rows(records, page, slot):
                     readings.append((None, None, '缺少配对结果'))
                 else:
                     corner = pair.get('corner_distance_m')
-                    readings.append((None if corner is None else corner * 100, pair.get('normal_error_deg'), match_detail(key, pair)))
+                    readings.append((None if corner is None else corner * 100, pair.get('normal_error_deg'), match_detail(key, pair, stage)))
         rows.append((label, readings))
     return rows
 
