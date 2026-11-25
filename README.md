@@ -1,4 +1,6 @@
-# LiDAR Cube Viewer V02 · APS 四雷达静态标定
+# LiDAR Cube Viewer V02 · 用户版
+
+面向现场标定人员，用于完成 APS 四雷达日常标定。需要逐包调参或排查标定算法时，请使用 [V01 开发版](https://github.com/Libpet-Siyuan-Owen/lidar_cube_viewer/tree/V01master)。
 
 一台 APS 采六个静态包，操作员在一个窗口核对六个靶框，点击一次即可求出前、左、右、顶四台雷达相对 `sensor_kit_base_link` 的安装外参。需要同一台车、同一次安装。软件固定前雷达，左、右两组共用同一个顶部雷达解。
 
