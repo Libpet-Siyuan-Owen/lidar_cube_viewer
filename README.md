@@ -56,14 +56,14 @@ mkdir -p ~/calibration_ws/data/aps_001
 cd ~/calibration_ws/data/aps_001
 record_pose() {
   local side="$1" pose="$2"
-  ros2 bag record -s sqlite3 -o "front_${side}_top_${pose}" \
+  timeout --preserve-status --signal=INT 6s ros2 bag record -s sqlite3 -o "front_${side}_top_${pose}" \
     /sensing/lidar/front/pointcloud_raw_ex \
     "/sensing/lidar/${side}/pointcloud_raw_ex" \
     /sensing/lidar/top/pointcloud_raw_ex /tf /tf_static
 }
 ```
 
-**每摆好一个位置，单独运行对应的一行。** 开始录制后，保持 APS 和标定物静止约 **6 秒**，然后按 `Ctrl+C` 结束当前包。前左顶和前右顶的六个摆位均按此时长采集。
+**每摆好一个位置，单独运行对应的一行。** 运行后保持 APS 和标定物静止。命令从启动起计时 **6 秒**，随后自动停止录制并保存当前包。等终端提示符重新出现，再移动标定物。前左顶和前右顶的六个摆位均按此时长采集。
 
 | 摆位 | 前左顶 | 前右顶 |
 |---|---|---|
