@@ -1,4 +1,6 @@
-# LiDAR Cube Viewer V01
+# LiDAR Cube Viewer V01 · 开发版
+
+面向开发人员，用于逐包调整 ROI、调试平面拟合参数和检查雷达配对结果。日常整车标定请使用 [V02 用户版](https://github.com/Libpet-Siyuan-Owen/lidar_cube_viewer/tree/V02master)。
 
 用静止采集的三面体点云标定一台机器的前、左、右和顶部雷达。工具在 ROS 2 bag 上离线运行，前雷达作为固定参考。完成六包联合拟合后，从 `FLRT_result_report_…/suggested_extrinsics.yaml` 取得四台雷达相对 `sensor_kit_base_link` 的安装外参。
 
@@ -10,7 +12,7 @@
 sudo apt update
 sudo apt install git python3-numpy python3-scipy python3-yaml python3-tk python3-matplotlib fonts-noto-cjk ros-humble-rclpy ros-humble-sensor-msgs ros-humble-tf2-msgs ros-humble-nav-msgs ros-humble-std-srvs
 
-git clone https://github.com/Libpet-Siyuan-Owen/lidar_cube_viewer.git
+git clone --branch V01master https://github.com/Libpet-Siyuan-Owen/lidar_cube_viewer.git
 cd lidar_cube_viewer
 source /opt/ros/humble/setup.bash
 /usr/bin/python3 lidar_cube_viewer.py
